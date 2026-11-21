@@ -166,8 +166,9 @@ def still(source: Path, at: float, target: Path) -> None:
 
 def wav(source: Path, target: Path, start: float = 0, end: float | None = None) -> None:
     length = ["-t", str(end - start)] if end is not None else []
-    ffmpeg("-ss", str(start), "-i", str(source), *length, "-vn", "-ar", "16000",
-           "-ac", "1", "-c:a", "pcm_s16le", str(target))
+    ffmpeg("-ss", str(start), "-i", str(source), *length, "-vn",
+           "-af", "highpass=f=85,dynaudnorm",
+           "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", str(target))
 
 
 def frames(seconds: float) -> int:

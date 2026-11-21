@@ -363,7 +363,10 @@ class Job:
 
         def adapt():
             media.cloud_window(self.source, start, end, proxy, dense=True)
-            transcript = speech.from_video(proxy, folder, has_audio)
+            try:
+                transcript = speech.from_video(proxy, folder, has_audio, vad_filter=False)
+            except TypeError:
+                transcript = speech.from_video(proxy, folder, has_audio)
             hints = [{key: row[key] for key in ("start", "end", "text")} for row in transcript]
             result, usage = model.adapt(proxy, hints, end - start)
             if hints and not result.turns and sum(row["end"] - row["start"] for row in hints) > 1.2:

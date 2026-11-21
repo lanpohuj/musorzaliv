@@ -270,10 +270,10 @@ class WorkflowChecks(unittest.TestCase):
                     pass
 
             class FakeSpeech:
-                def from_video(self, path, work, has_audio):
+                def from_video(self, path, work, has_audio, vad_filter=True):
                     return [{"start": 1.3, "end": 2, "text": "Go!"}] if has_audio else []
 
-                def read(self, path, language):
+                def read(self, path, language, vad_filter=True):
                     return []  # Also verifies timed phrase captions on ambiguous word alignment.
 
             jobs = Jobs(root / "jobs", root / "output")

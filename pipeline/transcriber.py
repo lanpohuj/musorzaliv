@@ -68,6 +68,7 @@ def extract_audio(video_path: str, output_wav: str) -> str:
         "-loglevel", "error",
         "-i", video_path,
         "-vn",
+        "-af", "highpass=f=85,dynaudnorm",
         "-acodec", "pcm_s16le",
         "-ar", "16000",
         "-ac", "1",
@@ -100,6 +101,7 @@ class Transcriber:
         self.model_size = self.cfg.get("model_size", "base")
         self.requested_device = str(self.cfg.get("device", "auto")).lower()
         self.requested_compute = str(self.cfg.get("compute_type", "auto")).lower()
+        self.compute_type = self.requested_compute if self.requested_compute != "auto" else "int8"
         self.batch_size = int(self.cfg.get("batch_size", 8))
         self.language = self.cfg.get("language", None)
 
@@ -175,34 +177,63 @@ class Transcriber:
             print(f"[!] CUDA недоступна ({type(e).__name__}: {str(e)[:120]}) — Whisper на CPU")
 
         compute = self.requested_compute if self.requested_compute != "auto" else "int8"
+        cpu_model = self.model_size
+        if cpu_model in ("large-v3-turbo", "large-v3", "large-v2", "large", "medium") and self.requested_device in ("auto", "cuda"):
+            cpu_model = self.cfg.get("cpu_fallback_model", "small")
+            print(f"[*] Відкат моделі для CPU: '{cpu_model}'")
+            self.model_size = cpu_model
         print(f"[*] Ініціалізація Whisper моделі: '{self.model_size}' (device=cpu, compute={compute})...")
         self.compute_type = compute
-        return WhisperModel(self.model_size, device="cpu", compute_type=compute), None
+        try:
+            return WhisperModel(self.model_size, device="cpu", compute_type=compute), None
+        except Exception as err:
+            if self.model_size != "small":
+                print(f"[!] Не вдалося завантажити '{self.model_size}' на CPU ({err}) — спроба 'small'")
+                self.model_size = "small"
+                return WhisperModel("small", device="cpu", compute_type=compute), None
+            raise
 
     @property
     def device(self) -> str:
         return getattr(self.model, "device", "cpu")
 
-    def transcribe(self, audio_wav: str) -> Tuple[List[Dict[str, Any]], float, str]:
+    def transcribe(
+        self,
+        audio_wav: str,
+        vad_filter: bool = True,
+        condition_on_previous_text: bool = True,
+        no_speech_threshold: float = 0.45,
+    ) -> Tuple[List[Dict[str, Any]], float, str]:
         """
         Transcribes the audio file with word timestamps and VAD filter.
         Returns (segments, total_duration, detected_language).
         """
+        cfg_vad = self.cfg.get("vad_parameters") or {}
         vad_params = dict(
-            min_silence_duration_ms=500,
-            speech_pad_ms=300
+            threshold=float(cfg_vad.get("threshold", self.cfg.get("vad_threshold", 0.28))),
+            min_speech_duration_ms=int(cfg_vad.get("min_speech_duration_ms", self.cfg.get("vad_min_speech_duration_ms", 100))),
+            min_silence_duration_ms=int(cfg_vad.get("min_silence_duration_ms", self.cfg.get("vad_min_silence_duration_ms", 250))),
+            speech_pad_ms=int(cfg_vad.get("speech_pad_ms", self.cfg.get("vad_speech_pad_ms", 350))),
         )
+        if "condition_on_previous_text" in self.cfg:
+            condition_on_previous_text = bool(self.cfg["condition_on_previous_text"])
+        if "no_speech_threshold" in self.cfg:
+            no_speech_threshold = float(self.cfg["no_speech_threshold"])
+
+        effective_vad_params = vad_params if vad_filter else None
 
         gen = None
         if self._batched is not None:
             try:
                 gen, info = self._batched.transcribe(
                     audio_wav,
-                    vad_filter=True,
-                    vad_parameters=vad_params,
+                    vad_filter=vad_filter,
+                    vad_parameters=effective_vad_params,
                     word_timestamps=True,
                     language=self.language,
                     batch_size=self.batch_size,
+                    condition_on_previous_text=condition_on_previous_text,
+                    no_speech_threshold=no_speech_threshold,
                 )
             except Exception as e:
                 print(f"[!] Батч-транскрибація впала ({e}) — перемикання на послідовну")
@@ -210,10 +241,12 @@ class Transcriber:
         if gen is None:
             gen, info = self.model.transcribe(
                 audio_wav,
-                vad_filter=True,
-                vad_parameters=vad_params,
+                vad_filter=vad_filter,
+                vad_parameters=effective_vad_params,
                 word_timestamps=True,
-                language=self.language
+                language=self.language,
+                condition_on_previous_text=condition_on_previous_text,
+                no_speech_threshold=no_speech_threshold,
             )
 
         segments = []

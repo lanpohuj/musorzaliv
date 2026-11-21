@@ -630,22 +630,87 @@ def checked_turns(script: Script, duration: float) -> list[dict]:
     return turns
 
 
+def _has_cuda() -> bool:
+    try:
+        import ctranslate2
+        if ctranslate2.get_cuda_device_count() > 0:
+            return True
+    except Exception:
+        pass
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _load_whisper_config() -> dict:
+    config_path = Path("config.yaml")
+    if config_path.is_file():
+        try:
+            import yaml
+            with open(config_path, "r", encoding="utf-8") as f:
+                data = yaml.safe_load(f) or {}
+                return data.get("whisper", {})
+        except Exception:
+            pass
+    return {}
+
+
 class LocalSpeech:
-    def __init__(self):
+    def __init__(self, config: dict | None = None):
+        self.config = config
         self.transcriber = None
 
-    def read(self, audio: Path, language: str) -> list[dict]:
+    def _resolve_transcriber_cfg(self) -> dict:
+        cfg = dict(self.config.get("whisper", {}) if self.config else _load_whisper_config())
+        cuda_available = _has_cuda()
+
+        req_device = os.environ.get("TWITCH_WHISPER_DEVICE", cfg.get("device", "auto")).lower()
+        if req_device in ("cuda", "gpu"):
+            device = "cuda"
+        elif req_device == "cpu":
+            device = "cpu"
+        else:
+            device = "cuda" if cuda_available else "cpu"
+
+        req_compute = os.environ.get("TWITCH_WHISPER_COMPUTE", cfg.get("compute_type", "auto")).lower()
+        if req_compute not in ("auto", ""):
+            compute_type = req_compute
+        else:
+            compute_type = "float16" if device == "cuda" else "int8"
+
+        env_model = os.environ.get("TWITCH_WHISPER_MODEL")
+        if env_model:
+            model_size = env_model
+        elif self.config and self.config.get("whisper", {}).get("model_size"):
+            model_size = self.config["whisper"]["model_size"]
+        elif cfg.get("twitch_model_size"):
+            model_size = cfg.get("twitch_model_size")
+        elif cfg.get("model_size") and cfg.get("model_size") not in ("base", "auto"):
+            model_size = cfg.get("model_size")
+        else:
+            model_size = "large-v3-turbo" if device == "cuda" else "small"
+
+        return {
+            "model_size": model_size,
+            "device": device,
+            "compute_type": compute_type,
+            "batch_size": int(cfg.get("batch_size", 8)),
+            "language": cfg.get("language", None),
+        }
+
+    def read(self, audio: Path, language: str, vad_filter: bool = True) -> list[dict]:
         if self.transcriber is None:
             from .transcriber import Transcriber
-            self.transcriber = Transcriber({"whisper": {
-                "model_size": os.environ.get("TWITCH_WHISPER_MODEL", "small"),
-                "device": "cpu", "compute_type": "int8",
-            }})
+            self.transcriber = Transcriber({"whisper": self._resolve_transcriber_cfg()})
         self.transcriber.language = language
-        segments, _, _ = self.transcriber.transcribe(str(audio))
+        segments, _, _ = self.transcriber.transcribe(str(audio), vad_filter=vad_filter)
         return segments
 
-    def from_video(self, video: Path, work: Path, has_audio: bool) -> list[dict]:
+    def from_video(self, video: Path, work: Path, has_audio: bool, vad_filter: bool = True) -> list[dict]:
         if not has_audio:
             return []
         path = work / "english.wav"
@@ -654,8 +719,7 @@ class LocalSpeech:
             return [
                 {"start": float(row["start"]), "end": float(row["end"]), "text": row["text"],
                  "words": [{"start": float(word["start"]), "end": float(word["end"])}
-                           for word in row["words"]]}
-                for row in self.read(path, "en")
+                           for row in self.read(path, "en", vad_filter=vad_filter)]}
             ]
         finally:
             path.unlink(missing_ok=True)
