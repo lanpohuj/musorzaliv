@@ -113,16 +113,37 @@ def audio_peaks(video: Path) -> list[float]:
         return []
     signal = samples[:blocks * per_block].reshape(blocks, per_block).astype(np.float32)
     rms = np.sqrt(np.mean(signal * signal, axis=1))
-    floor = max(350, float(np.median(rms)))
-    onsets = sorted(range(3, blocks), key=lambda i: -rms[i])
+
+    med = max(250.0, float(np.median(rms)))
+    mad = float(np.median(np.abs(rms - med)))
+    normalizer = max(100.0, mad * 1.4826)
+    z = (rms - med) / normalizer
+
+    k = min(blocks, 6)
+    kernel = np.ones(k) / k
+    rolling_rms = np.convolve(rms, kernel, mode="same")
+    rolling_z = (rolling_rms - med) / normalizer
+    p85 = float(np.percentile(rms, 85))
+
+    activation = 0.55 * z + 0.45 * rolling_z
+
+    candidates = []
+    for i in range(2, blocks):
+        prior = max(med, float(np.median(rms[max(0, i - 6):i])))
+        is_spike = z[i] >= 2.0
+        is_sustained = rolling_z[i] >= 1.5 and rms[i] >= p85
+        is_jump = rms[i] >= prior * 1.65 and z[i] >= 1.3
+        if is_spike or is_sustained or is_jump:
+            candidates.append(i)
+
+    candidates.sort(key=lambda i: -activation[i])
     peaks = []
-    for i in onsets:
-        prior = max(floor, float(np.median(rms[i - 3:i])))
-        if rms[i] >= prior * 2 and all(abs(i - old) >= 5 for old in peaks):
+    for i in candidates:
+        if all(abs(i - old) >= 4 for old in peaks):
             peaks.append(i)
-            if len(peaks) == 12:
+            if len(peaks) == 20:
                 break
-    return [i * .25 for i in sorted(peaks)]
+    return [round(i * 0.25, 2) for i in sorted(peaks)]
 
 
 def strict_schema(model: type[BaseModel]) -> dict:

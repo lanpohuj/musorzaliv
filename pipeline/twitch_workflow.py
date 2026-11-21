@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
+from difflib import SequenceMatcher
 import logging
 import shutil
 from tempfile import TemporaryDirectory
@@ -196,11 +197,15 @@ class Job:
                 for key in tokens:
                     tokens[key] += spent[key]
             if not (verdict.publish and verdict.opening.strip() and verdict.payoff.strip()
-                    and 0 <= verdict.hook_at <= 2 and verdict.hook_at < verdict.payoff_at < hi-lo):
+                    and 0 <= verdict.hook_at <= 5.0 and verdict.hook_at < verdict.payoff_at < hi-lo):
                 return None, tokens
+            speech_info = editor.compute_speech_signals(transcript(lo, hi), 0, hi - lo)
+            final_score = editor.multi_signal_score(item, speech_signal=speech_info["speech_signal"],
+                                                    audience_views=seed.get("audience_views", 0),
+                                                    novelty=verdict.novelty)
             item.update(hook_time=round(lo + verdict.hook_at, 3), peak=round(lo + verdict.payoff_at, 3),
                         reason=verdict.opening, evidence=verdict.payoff,
-                        score=round(.7 * verdict.novelty + .3 * item["score"], 1))
+                        score=final_score)
             if "audience_views" in seed:
                 item["audience_views"] = seed["audience_views"]
             return item, tokens
@@ -214,6 +219,7 @@ class Job:
             collect(tokens)
             return [unique[i] for i in dict.fromkeys(result.indices) if 0 <= i < len(unique)]
 
+        targets = editor.dynamic_vod_targets(length)
         try:
             for n, (start, end) in enumerate(windows, 1):
                 self.progress(f"Облачный просмотр VOD · окно {n} из {len(windows)}", n - 1, len(windows))
@@ -225,16 +231,17 @@ class Job:
                     if item and item["score"] >= 54:
                         item["dialogue"] = " ".join(r["text"] for r in transcript
                                                     if start+r["end"] > item["start"]
-                                                    and start+r["start"] < item["end"])[:700]
+                                                    and start+r["start"] < item["end"])
                         if realtime:
                             item["signals"] = sorted({kind for t, kind in state.get("live_signals", [])
                                                       if item["start"] <= t <= item["end"]+5})
                         events.append(item)
-            pool = editor.deduplicate(events)
+            merged_events = editor.merge_semantic_events(events, max_duration=95.0)
+            pool = editor.deduplicate(merged_events)
             ranked_pool = pool.copy()
             first_round = []
             candidate_count = len(pool)
-            if (realtime and pool) or len(pool) > editor.REFINE_LIMIT:
+            if (realtime and pool) or len(pool) > targets["refine_limit"]:
                 pool.sort(key=lambda item: item["peak"])
                 def compare(group):
                     result, tokens = self._cloud_cache(["compare-v1", group], editor.Nominations,
@@ -244,7 +251,7 @@ class Job:
                     pool, tokens = compare(pool)
                     collect(tokens)
                     pool = pool[:2]
-                while len(pool) > editor.REFINE_LIMIT:
+                while len(pool) > targets["refine_limit"]:
                     groups = [pool[i:i + 60] for i in range(0, len(pool), 60)]
                     self.progress(f"Сравнение {len(pool)} моментов по завязке и развязке", 0, len(groups))
                     with ThreadPoolExecutor(max_workers=3) as comparisons:
@@ -267,17 +274,28 @@ class Job:
                 # Preserve promising episodes from early comparison groups and spread backup checks over the VOD.
                 priority = first_round + ranked_pool
                 reserve = []
-                covered = set()
                 checked = list(nominated)
-                region_seconds = max(30 * 60, length / editor.VOD_RESERVE_LIMIT)
+                region_seconds = 1800.0
+                region_counts = {}
+                max_per_region = max(2, int(targets["reserve_limit"] // max(1, length / region_seconds) + 1))
                 for seed in priority:
                     region = int(seed["peak"] // region_seconds)
-                    if region in covered or any(abs(seed["peak"] - other["peak"]) < 90 for other in checked):
+                    if region_counts.get(region, 0) >= max_per_region:
+                        continue
+                    is_duplicate = any(
+                        abs(seed["peak"] - other["peak"]) < 25
+                        or (abs(seed["peak"] - other["peak"]) < 90
+                            and SequenceMatcher(None, seed["title"].casefold(), other["title"].casefold()).ratio() >= 0.4)
+                        or (int(other["peak"] // region_seconds) == region
+                            and SequenceMatcher(None, seed["title"].casefold(), other["title"].casefold()).ratio() >= 0.55)
+                        for other in checked
+                    )
+                    if is_duplicate:
                         continue
                     reserve.append(seed)
                     checked.append(seed)
-                    covered.add(region)
-                    if len(reserve) >= editor.VOD_RESERVE_LIMIT:
+                    region_counts[region] = region_counts.get(region, 0) + 1
+                    if len(reserve) >= targets["reserve_limit"]:
                         break
                 with ThreadPoolExecutor(max_workers=3) as workers:
                     selected = []
@@ -292,8 +310,8 @@ class Job:
                                 checked_clips.append(item)
                             self.progress(f"{stage} · {n} из {len(batch)}", n, len(batch))
                         self.progress("Сравнение готовых фрагментов", 0, 1)
-                        selected.extend(rank_reviewed(checked_clips)[:editor.VOD_REVIEW_MAX - len(selected)])
-                        if not reserve or len(selected) >= editor.VOD_REVIEW_TARGET:
+                        selected.extend(rank_reviewed(checked_clips)[:targets["max"] - len(selected)])
+                        if not reserve or len(selected) >= targets["target"]:
                             break
                         batch = reserve
                         reserve = []
@@ -308,8 +326,8 @@ class Job:
                     if result.event is None:
                         continue
                     item = editor.checked_event(result.event, start, end - start)
-                    if (item and item["score"] >= 65 and item["end"] - item["start"] <= 49
-                            and abs(item["peak"] - seed["peak"]) <= 12):
+                    if (item and item["score"] >= 65 and item["end"] - item["start"] <= 95
+                            and abs(item["peak"] - seed["peak"]) <= 15):
                         transcript = editor.read_json(transcript_file(start, end)) or []
                         item = editor.snap_speech(item, transcript, start, end)
                         item = editor.include_reaction_tail(item, transcript, start, end)
@@ -320,7 +338,7 @@ class Job:
             analysis_proxy.unlink(missing_ok=True)
 
         if not contextual_review:
-            selected = editor.deduplicate(refined)[:editor.TOP_CLIPS]
+            selected = editor.deduplicate(refined)[:targets["top_clips"]]
         clips = []
         for n, clip in enumerate(selected, 1):
             clip_id = editor.stable_id([clip["start"], clip["peak"], clip["end"]])

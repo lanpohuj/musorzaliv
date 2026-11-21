@@ -139,7 +139,7 @@ class EditorChecks(unittest.TestCase):
 
     def test_all_vod_seconds_are_covered(self):
         windows = editor.window_ranges(7312.5)
-        self.assertEqual(windows[0], (0, 90))
+        self.assertEqual(windows[0], (0, 150))
         self.assertEqual(windows[-1][1], 7312.5)
         for previous, following in zip(windows, windows[1:]):
             self.assertGreaterEqual(previous[1] - following[0], 20)

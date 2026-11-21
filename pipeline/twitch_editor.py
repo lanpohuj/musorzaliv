@@ -20,17 +20,17 @@ from .twitch_media import EditError, RATE, camera_box, ffmpeg, probe, wav
 
 GEMINI_MODEL = "gemini-3.8-flash"
 FISH_MODEL = "s2.1-pro"
-SCAN_SECONDS = 90
-SCAN_STEP = 70
+SCAN_SECONDS = 150
+SCAN_STEP = 110
 SCAN_FPS = 2
 DENSE_FPS = 6
-TOP_CLIPS = 8
+TOP_CLIPS = 35
 REFINE_LIMIT = 16
 VOD_RESERVE_LIMIT = 12
 VOD_REVIEW_TARGET = 4
 VOD_REVIEW_MAX = 5
 # Change the cache version when prompts, media parameters or response contracts change.
-EDITOR_VERSION = 2
+EDITOR_VERSION = 3
 DUB_VERSION = 2
 VOICE_ID = re.compile(r"[a-fA-F0-9]{32}")
 
@@ -90,7 +90,7 @@ class Nominations(BaseModel):
 
 
 class HighlightRanking(BaseModel):
-    indices: list[int] = Field(max_length=VOD_REVIEW_MAX)
+    indices: list[int] = Field(max_length=60)
 
 
 class OpeningReview(BaseModel):
@@ -199,6 +199,76 @@ def estimate(duration: float, *, twitch_vod: bool = False) -> dict:
             "provider": provider, "model": model}
 
 
+def dynamic_vod_targets(length_seconds: float) -> dict[str, int]:
+    hours = max(1.0, length_seconds / 3600.0)
+    target_clips = int(min(25, max(4, round(hours * 1.8))))
+    max_clips = int(min(30, max(5, round(target_clips * 1.25))))
+    refine_limit = int(min(80, max(16, round(hours * 3.5))))
+    reserve_limit = int(min(50, max(12, round(10.0 + hours * 2.0))))
+    return {
+        "target": target_clips,
+        "max": max_clips,
+        "refine_limit": refine_limit,
+        "reserve_limit": reserve_limit,
+        "top_clips": max_clips,
+    }
+
+
+def compute_speech_signals(transcript: list[dict], event_start: float, event_end: float) -> dict:
+    duration = max(1.0, event_end - event_start)
+    words = []
+    text_parts = []
+    for row in transcript:
+        r_start = row.get("start", 0.0)
+        r_end = row.get("end", 0.0)
+        if r_end > event_start and r_start < event_end:
+            text_parts.append(row.get("text", ""))
+            row_words = row.get("words", [])
+            if row_words:
+                for w in row_words:
+                    if w.get("end", 0) > event_start and w.get("start", 0) < event_end:
+                        words.append(w.get("word", ""))
+            else:
+                words.extend(row.get("text", "").split())
+
+    wpm = (len(words) / duration) * 60.0
+    wpm_score = min(100.0, max(0.0, (wpm - 120.0) * 1.25))
+
+    joined_text = " ".join(text_parts)
+    exclamations = joined_text.count("!")
+    caps = sum(1 for token in joined_text.split() if len(token) >= 3 and token.isupper())
+    hype_keywords = ("omg", "wow", "holy", "damn", "yes", "no way", "lmao", "lol", "gg",
+                     "жесть", "красава", "да ладно", "хаха", "ахах", "давай", "ура", "клатч",
+                     "ай", "ой", "хорош", "капец")
+    lower_text = joined_text.lower()
+    hype_count = sum(lower_text.count(kw) for kw in hype_keywords)
+    emotion_score = min(100.0, exclamations * 18.0 + caps * 12.0 + hype_count * 20.0)
+
+    speech_signal = round(0.55 * wpm_score + 0.45 * emotion_score, 1)
+    return {
+        "wpm": round(wpm, 1),
+        "wpm_score": round(wpm_score, 1),
+        "emotion_score": round(emotion_score, 1),
+        "speech_signal": speech_signal,
+    }
+
+
+def multi_signal_score(event: dict, speech_signal: float = 0.0, audio_signal: float = 0.0,
+                       audience_views: int = 0, novelty: float | None = None) -> float:
+    base_score = float(event.get("score") if event.get("score") is not None else score(event))
+    if novelty is not None:
+        llm_score = 0.5 * float(novelty) + 0.5 * base_score
+    else:
+        llm_score = base_score
+
+    audience_boost = min(15.0, math.log10(max(1, audience_views)) * 3.5) if audience_views > 0 else 0.0
+    speech_boost = min(10.0, (speech_signal / 100.0) * 10.0) if speech_signal > 25 else 0.0
+    audio_boost = min(10.0, (audio_signal / 100.0) * 10.0) if audio_signal > 25 else 0.0
+
+    total = llm_score + 0.5 * audience_boost + 0.3 * speech_boost + 0.2 * audio_boost
+    return round(min(100.0, max(0.0, total)), 1)
+
+
 def score(event: dict) -> float:
     return round(0.29 * event["hook"] + 0.34 * event["payoff"]
                  + 0.25 * event["standalone"] + 0.12 * event["energy"], 1)
@@ -217,17 +287,19 @@ def checked_event(event: Event, offset: float, duration: float) -> dict | None:
 
 def opening_context(seed: dict, length: float) -> tuple[float, float]:
     if "audience_views" in seed:
-        return max(0, seed["start"] - 10), min(length, seed["end"] + 8)
+        return max(0, seed["start"] - 15), min(length, seed["end"] + 15)
     return limit_window(seed, length)
 
 
 def checked_highlight(cut: HighlightEdit, offset: float, length: float, seed: dict) -> dict | None:
     # Keep the setup required to understand the payoff, including complete opening words.
+    duration = cut.end_at - cut.start_at
+    hook_offset = cut.hook_at - cut.start_at
     if (not cut.publish or not cut.title.strip() or not cut.opening.strip() or not cut.payoff.strip()
             or not cut.start_at <= cut.hook_at < cut.payoff_at < min(cut.end_at, length)
             or cut.end_at > length + .1
-            or cut.hook_at - cut.start_at > 2 or not 3 <= cut.end_at - cut.start_at <= 50
-            or not seed["start"] - 8 <= offset + cut.payoff_at <= seed["end"] + 8):
+            or hook_offset > 5.0 or not 3 <= duration <= 95
+            or not seed["start"] - 15 <= offset + cut.payoff_at <= seed["end"] + 15):
         return None
     return dict(start=round(offset + cut.start_at, 3), hook_time=round(offset + cut.hook_at, 3),
                 peak=round(offset + cut.payoff_at, 3), end=round(offset + min(length, cut.end_at), 3),
@@ -242,10 +314,61 @@ def apply_opening(item: dict, verdict: OpeningReview, minimum_novelty: int) -> d
             and verdict.payoff.strip() and verdict.hook_at < verdict.payoff_at < duration
             and duration - verdict.hook_at >= 3):
         return None
+    new_score = multi_signal_score(item, novelty=verdict.novelty,
+                                   audience_views=item.get("audience_views", 0))
     return {**item, "start": round(start + max(0, verdict.hook_at - .35), 3),
             "hook_time": round(start + verdict.hook_at, 3),
             "peak": round(start + verdict.payoff_at, 3), "reason": verdict.opening,
-            "evidence": verdict.payoff, "score": round(.7 * verdict.novelty + .3 * item["score"], 1)}
+            "evidence": verdict.payoff, "score": new_score}
+
+
+def merge_semantic_events(events: list[dict], max_duration: float = 95.0) -> list[dict]:
+    if len(events) < 2:
+        return list(events)
+    sorted_events = sorted(events, key=lambda e: (e["start"], e["peak"]))
+    merged: list[dict] = []
+
+    for current in sorted_events:
+        if not merged:
+            merged.append(dict(current))
+            continue
+        prev = merged[-1]
+        gap = current["start"] - prev["end"]
+        potential_duration = max(prev["end"], current["end"]) - min(prev["start"], current["start"])
+
+        if potential_duration <= max_duration and gap <= 12.0:
+            title_sim = SequenceMatcher(None, prev["title"].casefold(), current["title"].casefold()).ratio()
+            prev_text = (prev.get("dialogue") or prev.get("reason") or "").casefold()
+            curr_text = (current.get("dialogue") or current.get("reason") or "").casefold()
+            text_sim = (SequenceMatcher(None, prev_text[:200], curr_text[:200]).ratio()
+                        if prev_text and curr_text else 0.0)
+
+            kind_compatible = (
+                prev.get("kind") == current.get("kind")
+                or {prev.get("kind"), current.get("kind")} <= {"play", "reaction"}
+                or {prev.get("kind"), current.get("kind")} <= {"story", "reaction"}
+            )
+
+            is_same_scene = (title_sim >= 0.45 or text_sim >= 0.4 or (gap <= 5.0 and kind_compatible))
+            if is_same_scene:
+                prev["start"] = min(prev["start"], current["start"])
+                prev["end"] = max(prev["end"], current["end"])
+                if current.get("payoff", 0) > prev.get("payoff", 0) or current.get("score", 0) > prev.get("score", 0):
+                    prev["peak"] = current["peak"]
+                    prev["title"] = current["title"]
+                d1 = prev.get("dialogue", "")
+                d2 = current.get("dialogue", "")
+                if d1 and d2 and d2 not in d1:
+                    prev["dialogue"] = (d1 + " " + d2).strip()
+                elif d2 and not d1:
+                    prev["dialogue"] = d2
+                if "evidence" in current and current["evidence"] not in prev.get("evidence", ""):
+                    prev["evidence"] = (prev.get("evidence", "") + "; " + current["evidence"]).strip("; ")
+                prev["score"] = round(min(100.0, max(prev["score"], current["score"]) + 2.0), 1)
+                continue
+
+        merged.append(dict(current))
+    return merged
 
 
 def deduplicate(events: list[dict]) -> list[dict]:
@@ -283,16 +406,16 @@ def camera_spans(regions: list[Camera], offset: float, duration: float) -> list[
     return spans
 
 
-def limit_window(event: dict, duration: float) -> tuple[float, float]:
-    start = max(0.0, min(event["start"] - 8, event["peak"] - 20))
-    end = min(duration, max(event["end"] + 8, event["peak"] + 20))
-    if end - start > 65:
-        start = max(0.0, event["peak"] - 30)
-        end = min(duration, start + 65)
+def limit_window(event: dict, duration: float, max_window: float = 120.0) -> tuple[float, float]:
+    start = max(0.0, min(event["start"] - 15, event["peak"] - 45))
+    end = min(duration, max(event["end"] + 15, event["peak"] + 45))
+    if end - start > max_window:
+        start = max(0.0, event["peak"] - max_window / 2)
+        end = min(duration, start + max_window)
     return round(start, 3), round(end, 3)
 
 
-def snap_speech(event: dict, transcript: list[dict], offset: float, end: float) -> dict:
+def snap_speech(event: dict, transcript: list[dict], offset: float, end: float, max_clip_duration: float = 95.0) -> dict:
     """Keep a nearby sentence edge or, at least, the complete boundary word."""
     result = dict(event)
     for edge, padding in (("start", -.06), ("end", .06)):
@@ -309,17 +432,17 @@ def snap_speech(event: dict, transcript: list[dict], offset: float, end: float) 
                 adjust = word[edge]
             result[edge] = round(min(end, max(offset, offset + adjust + padding)), 3)
             break
-    return result if result["end"] - result["start"] <= 49 else event
+    return result if result["end"] - result["start"] <= max_clip_duration else event
 
 
-def include_reaction_tail(event: dict, transcript: list[dict], offset: float, maximum: float) -> dict:
+def include_reaction_tail(event: dict, transcript: list[dict], offset: float, maximum: float, max_clip_duration: float = 95.0) -> dict:
     """Keep a short post-play reaction when a cut ends right on the result."""
     if event["kind"] != "play" or event["end"] - event["peak"] > 1.25:
         return event
     for line in transcript:
         start, stop = offset + line["start"], offset + line["end"]
-        if (0 <= start - event["end"] <= 1.25 and stop <= min(maximum, event["peak"] + 6)
-                and stop - event["start"] <= 48.8):
+        if (0 <= start - event["end"] <= 1.25 and stop <= min(maximum, event["peak"] + 10)
+                and stop - event["start"] <= max_clip_duration - 0.2):
             return {**event, "end": round(min(maximum, stop + .12), 3)}
     return event
 
@@ -438,7 +561,7 @@ class EditingModel:
             f"Edit one Twitch Short from this {duration:.2f}s context. The following seed is only a "
             "timestamp hint; verify every beat against the footage and timed English speech. Find the "
             "same episode, using the preceding setup or following reaction when the initial cut missed it. "
-            "Choose the shortest complete continuous cut. Start on a clear hook within two seconds: "
+            "Choose a complete continuous cut of 20 to 95 seconds capturing setup, climax, and reaction. Start on a clear hook within two to five seconds: "
             "a funny or impossible claim, a prediction, a risky choice, an unusual image, or a surprise "
             "already in progress. Include the minimal words or image needed to make the end understandable. "
             "The payoff may be a reveal, an earned reaction or a joke; ordinary gameplay, streamer "
