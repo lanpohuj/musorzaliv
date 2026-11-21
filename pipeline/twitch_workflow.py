@@ -221,6 +221,7 @@ class Job:
 
         targets = editor.dynamic_vod_targets(length)
         try:
+            min_scan_score = 48 if (realtime and state.get("live_signals")) else 54
             for n, (start, end) in enumerate(windows, 1):
                 self.progress(f"Облачный просмотр VOD · окно {n} из {len(windows)}", n - 1, len(windows))
                 result, tokens = self._cloud_cache(["scan", start, end], editor.Scan, lambda: scan(start, end))
@@ -228,7 +229,7 @@ class Job:
                 transcript = editor.read_json(transcript_file(start, end)) or []
                 for raw in result.events:
                     item = editor.checked_event(raw, start, end-start)
-                    if item and item["score"] >= 54:
+                    if item and item["score"] >= min_scan_score:
                         item["dialogue"] = " ".join(r["text"] for r in transcript
                                                     if start+r["end"] > item["start"]
                                                     and start+r["start"] < item["end"])
@@ -236,6 +237,24 @@ class Job:
                             item["signals"] = sorted({kind for t, kind in state.get("live_signals", [])
                                                       if item["start"] <= t <= item["end"]+5})
                         events.append(item)
+            if realtime and not events and state.get("live_signals"):
+                for sig_time, kind in state.get("live_signals")[:3]:
+                    sig_start = max(0.0, round(sig_time - 15.0, 3))
+                    sig_end = min(length, round(sig_time + 25.0, 3))
+                    if sig_end - sig_start >= 20.0:
+                        events.append({
+                            "start": sig_start,
+                            "peak": round(sig_time, 3),
+                            "end": sig_end,
+                            "title": f"Яркий момент ({kind})",
+                            "kind": "reaction" if kind == "audio" else "play",
+                            "evidence": f"Всплеск активности: {kind}",
+                            "reason": f"Сигнал зрителей или звука: {kind}",
+                            "hook": 60, "payoff": 65, "standalone": 60, "energy": 75,
+                            "score": 58,
+                            "signals": [kind],
+                            "dialogue": "",
+                        })
             merged_events = editor.merge_semantic_events(events, max_duration=95.0)
             pool = editor.deduplicate(merged_events)
             ranked_pool = pool.copy()
@@ -250,7 +269,7 @@ class Job:
                 if realtime and len(pool) <= 60:
                     pool, tokens = compare(pool)
                     collect(tokens)
-                    pool = pool[:2]
+                    pool = pool[:min(len(pool), 6)]
                 while len(pool) > targets["refine_limit"]:
                     groups = [pool[i:i + 60] for i in range(0, len(pool), 60)]
                     self.progress(f"Сравнение {len(pool)} моментов по завязке и развязке", 0, len(groups))
@@ -317,6 +336,11 @@ class Job:
                         reserve = []
                         reviewed += len(batch)
             else:
+                refine_dropped = 0
+                opening_dropped = 0
+                min_refine_score = 56 if realtime else 65
+                max_peak_drift = 25 if realtime else 15
+                min_novelty = 52 if realtime else 78
                 for n, seed in enumerate(nominated, 1):
                     self.progress(f"Повторный просмотр · {n} из {len(nominated)}", n - 1, len(nominated))
                     start, end = editor.limit_window(seed, length)
@@ -324,20 +348,32 @@ class Job:
                                                         lambda: refine(seed, start, end))
                     collect(tokens)
                     if result.event is None:
+                        refine_dropped += 1
                         continue
                     item = editor.checked_event(result.event, start, end - start)
-                    if (item and item["score"] >= 65 and item["end"] - item["start"] <= 95
-                            and abs(item["peak"] - seed["peak"]) <= 15):
+                    if (item and item["score"] >= min_refine_score and item["end"] - item["start"] <= 95
+                            and abs(item["peak"] - seed["peak"]) <= max_peak_drift):
                         transcript = editor.read_json(transcript_file(start, end)) or []
                         item = editor.snap_speech(item, transcript, start, end)
                         item = editor.include_reaction_tail(item, transcript, start, end)
                         item["cameras"] = editor.camera_spans(result.cameras, start, end - start)
-                        check_opening(item, minimum_novelty=78)
+                        before_opening = len(refined)
+                        check_opening(item, minimum_novelty=min_novelty)
+                        if len(refined) == before_opening:
+                            opening_dropped += 1
+                    else:
+                        refine_dropped += 1
         finally:
             model.close()
             analysis_proxy.unlink(missing_ok=True)
 
         if not contextual_review:
+            if not refined and realtime and pool:
+                best = dict(max(pool, key=lambda x: (len(x.get("signals", [])), x.get("score", 0))))
+                best.setdefault("cameras", [])
+                best["live_rating"] = "signal_fallback"
+                best["score"] = round(max(50.0, min(best.get("score", 55), 65.0)), 1)
+                refined.append(best)
             selected = editor.deduplicate(refined)[:targets["top_clips"]]
         clips = []
         for n, clip in enumerate(selected, 1):
@@ -352,9 +388,21 @@ class Job:
                         reference_start=start, reference_end=end, turns=[], scripted=False)
             clip["ad_at"] = media.choose_ad_point(clip)
             clips.append(clip)
+        debug_stats = {
+            "realtime": realtime,
+            "scan_events": len(events),
+            "pool": candidate_count,
+            "nominated": len(nominated),
+            "refine_dropped": refine_dropped if not contextual_review else 0,
+            "opening_dropped": opening_dropped if not contextual_review else 0,
+            "refined": len(refined),
+            "selected": len(selected),
+        }
+        if realtime:
+            print(f"[*] Live batch debug stats: {debug_stats}")
         self.update(status="review", clips=clips, contextual_review=contextual_review,
                     analysis_provider=editor.analysis_config()[0], candidates=candidate_count, finalists=reviewed, audience_candidates=len(audience),
-                    covered_windows=len(windows), analysis_usage=usage, progress=None)
+                    covered_windows=len(windows), analysis_usage=usage, debug_stats=debug_stats, progress=None)
 
     @staticmethod
     def _reference(folder: Path, source: Path, start: float, end: float) -> None:

@@ -171,7 +171,7 @@ def align_turns_to_speech(script: Script, transcript: list[dict], duration: floa
 
 
 class Nominations(BaseModel):
-    indices: list[int] = Field(max_length=4)
+    indices: list[int] = Field(max_length=6)
 
 
 class HighlightRanking(BaseModel):
@@ -621,7 +621,7 @@ class EditingModel:
         rows = [[i, c["kind"], c["title"], c["evidence"], c.get("dialogue", ""), *c.get("signals", [])]
                 for i, c in enumerate(candidates)]
         return self.query("Compare these independent Twitch moments as a Shorts editor. Select "
-                          "0-4 indices in strongest-first order. Prefer a specific surprising line, "
+                          "0-6 indices in strongest-first order. Prefer a specific surprising line, "
                           "contradiction, authentic streamer reaction or escalating joke with a payoff. "
                           "Reject ordinary mission progress, cutscenes, routine kills, loot and generic "
                           "exclamations. Can the first beat make a stranger want the ending? No quota. "

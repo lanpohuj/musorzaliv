@@ -1,4 +1,5 @@
 """Record and evaluate overlapping Twitch live windows while capture continues."""
+from concurrent.futures import ThreadPoolExecutor
 import csv
 from collections import deque
 import socket
@@ -118,6 +119,7 @@ class LiveSessions:
         from yt_dlp import YoutubeDL
         capture = None
         chat_done = Event()
+        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"live-{job.id[:8]}")
         try:
             with YoutubeDL({"quiet": True, "no_warnings": True, "socket_timeout": 15,
                            "format": "b[height<=1080]/b"}) as downloader:
@@ -133,7 +135,8 @@ class LiveSessions:
                 Thread(target=self._guard, args=(capture, stop, job.folder), daemon=True).start()
                 chat = ChatPulse()
                 Thread(target=chat.listen, args=(channel, chat_done), daemon=True).start()
-                self._consume(job, capture, stop, chat)
+                self._consume(job, capture, stop, chat, executor)
+            executor.shutdown(wait=True)
             job.update(status="live_done", progress=None, live_summary=job.read().get("progress", {}).get("message"))
         except Exception as exc:
             message = str(exc) if isinstance(exc, media.EditError) else (
@@ -141,6 +144,7 @@ class LiveSessions:
                 f"Запись эфира прервалась ({type(exc).__name__}).")
             job.update(status="live_done", error=message, progress=None)
         finally:
+            executor.shutdown(wait=False)
             chat_done.set()
             if capture and capture.poll() is None:
                 capture.terminate()
@@ -163,7 +167,7 @@ class LiveSessions:
                     proc.send_signal(signal.SIGINT)
                 return
 
-    def _consume(self, job, proc, stop, chat):
+    def _consume(self, job, proc, stop, chat, executor=None):
         index, quiet, first = 0, 0, 0
         seen = []
         signals = []
@@ -182,9 +186,10 @@ class LiveSessions:
                     continue
                 quiet += duration
                 index += 1
-                # Include the following segment for the payoff after an audio reaction.
+
+                # Check spikes when we have at least 4 segments (120s window)
                 spike = False
-                if index - first >= 3:
+                if index - first >= 4:
                     name, start, end = rows[index-2]
                     start, end = float(start), float(end)
                     chat_times = chat.times(start, end + 5)
@@ -193,16 +198,25 @@ class LiveSessions:
                     signals.extend((start + t, "audio") for t in jumps)
                     signals.extend((t, "chat") for t in chat_times)
                     spike = bool(chat_times or jumps)
-                if spike or quiet >= 180 or (ended and index == len(rows)):
-                    self._batch(job, rows[first:index], seen, signals)
-                    signals = [(t, kind) for t, kind in signals if t >= float(rows[index-1][1])]
-                    keep = index-1
+
+                # Trigger batch if spike detected (with >= 4 segments), or buffer reached 5 segments (150s),
+                # or quiet duration >= 180s, or stream ended
+                if (spike and index - first >= 4) or (index - first >= 5) or quiet >= 180 or (ended and index == len(rows)):
+                    batch_rows = rows[first:index]
+                    self._dispatch_batch(job, batch_rows, seen, signals, executor)
+
+                    # Keep 2 segments (60s) for overlap into next batch
+                    keep = max(first, index - 2)
+                    signals = [(t, kind) for t, kind in signals if t >= float(rows[keep][1])]
                     for name, _, _ in rows[first:keep]:
                         (job.folder / name).unlink(missing_ok=True)
                     first, quiet = keep, 0
             if ended:
-                if quiet >= 3:
-                    self._batch(job, rows[first:index], seen, signals)
+                if index > first and (index - first >= 2 or quiet >= 30):
+                    batch_rows = rows[first:index]
+                    self._dispatch_batch(job, batch_rows, seen, signals, executor)
+                    for name, _, _ in rows[first:index]:
+                        (job.folder / name).unlink(missing_ok=True)
                 if shutil.disk_usage(job.folder).free < 2 * 1024**3:
                     raise media.EditError("Наблюдение остановлено: на диске осталось менее 2 ГиБ.")
                 if not stop.is_set() and proc.returncode:
@@ -210,36 +224,69 @@ class LiveSessions:
                 return
             time.sleep(1)
 
-    def _batch(self, parent, rows, seen, signals=()):
+    def _dispatch_batch(self, parent, rows, seen, signals=(), executor=None):
+        if executor is not None:
+            child, origin, last_row = self._prepare_batch(parent, rows, signals)
+            if child:
+                executor.submit(self._analyze_batch, child, parent, origin, seen, last_row)
+        else:
+            self._batch(parent, rows, seen, signals)
+
+    def _prepare_batch(self, parent, rows, signals=()):
         from dataclasses import asdict
         origin = float(rows[0][1])
         channel = parent.read()["channel"]
         child = self.manager.create("", f"{channel} · эфир +{int(origin)//60} мин")
         child.update(live_pending=True, live_origin=origin,
                      live_signals=[(round(t-origin, 2), kind) for t, kind in signals if t >= origin])
-        manifest = parent.folder / "window.txt"
+        manifest = parent.folder / f"window-{child.id}.txt"
         manifest.write_text("".join(f"file '{r[0]}'\n" for r in rows))
+        target = child.folder / "source.mkv"
         try:
-            target = child.folder / "source.mkv"
             media.ffmpeg("-f", "concat", "-safe", "1", "-i", str(manifest), "-c", "copy", str(target))
+            manifest.unlink(missing_ok=True)
             info = media.probe(target)
             media.still(target, min(1, info.duration/2), child.folder / "source.jpg")
             child.update(status="analyzing", operation="analyze", previous="source_ready",
                          source=target.name, source_info=asdict(info))
+            return child, origin, rows[-1]
+        except Exception as exc:
+            manifest.unlink(missing_ok=True)
+            child.update(status="failed", operation="analyze", previous="source_ready",
+                         error=str(exc) if isinstance(exc, media.EditError) else "Не удалось подготовить окно эфира.",
+                         progress=None)
+            print(f"[!] Ошибка подготовки окна эфира {child.id}: {exc}")
+            return None, origin, rows[-1]
+
+    def _analyze_batch(self, child, parent, origin, seen, last_row):
+        try:
             child.analyze()
             clips = []
-            for clip in child.read()["clips"]:
+            for clip in child.read().get("clips", []):
                 peak = origin + clip["peak"]
                 if all(abs(peak-other) > 5 for other in seen):
                     clips.append(clip)
                     seen.append(peak)
+            stats = child.read().get("debug_stats") or {}
+            batches_stats = parent.read().get("batches_stats", {})
+            batches_stats[child.id] = stats
+            parent.update(batches_stats=batches_stats)
             if clips:
                 child.update(clips=clips, live_pending=False)
                 parent.update(batches=parent.read()["batches"] + [child.id])
             else:
-                shutil.rmtree(child.folder)
-            parent.progress(f"Проверено до {int(float(rows[-1][2]))} с эфира · найдено {len(seen)}", 0, 0)
+                child.update(live_pending=False, clips=[])
+                print(f"[*] Батч {child.id} (+{int(origin)//60} мин) завершен без клипов: stats={stats}")
+                shutil.rmtree(child.folder, ignore_errors=True)
+            parent.progress(f"Проверено до {int(float(last_row[2]))} с эфира · найдено {len(seen)}", 0, 0)
         except Exception as exc:
+            import traceback
+            err_msg = str(exc) if isinstance(exc, media.EditError) else f"Ошибка анализа окна эфира ({type(exc).__name__}): {exc}"
+            print(f"[!] Ошибка анализа окна эфира {child.id}: {err_msg}\n{traceback.format_exc()}")
             child.update(status="failed", operation="analyze", previous="source_ready",
-                         error=str(exc) if isinstance(exc, media.EditError) else "Не удалось проверить окно эфира.", progress=None)
-            raise media.EditError("Ошибка анализа окна эфира. Подробности в задаче " + child.id + ".") from exc
+                         error=err_msg, progress=None)
+
+    def _batch(self, parent, rows, seen, signals=()):
+        child, origin, last_row = self._prepare_batch(parent, rows, signals)
+        if child:
+            self._analyze_batch(child, parent, origin, seen, last_row)
