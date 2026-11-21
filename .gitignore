@@ -1,0 +1,16 @@
+.env
+.venv*/
+__pycache__/
+*.pyc
+temp/*
+!temp/.gitkeep
+output_clips/*
+!output_clips/.gitkeep
+input_videos/*
+!input_videos/.gitkeep
+assets/fonts/ObelixPro.ttf
+.env.*
+!.env.example
+.DS_Store
+assets/tiktok_accounts.json
+assets/downloaded_archive.txt

@@ -1,0 +1,9 @@
+[Unit]
+Description=Activate GTA editor after credential setup
+
+[Path]
+PathChanged=/etc/trygta.env
+Unit=trygta.service
+
+[Install]
+WantedBy=multi-user.target

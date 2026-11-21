@@ -1,0 +1,140 @@
+paths:
+  input_dir: input_videos
+  output_dir: output_clips
+  temp_dir: temp
+  assets_dir: assets
+  auto_archive: true
+video:
+  target_width: 1080
+  target_height: 1920
+  crop_mode: center_crop
+  zoom: 1.08
+  speed: 1.04
+  color_grade:
+    enabled: true
+    contrast: 1.03
+    brightness: 0.01
+    saturation: 1.05
+  use_nvenc: true
+  nvenc_preset: p4
+  video_bitrate: 6M
+  uniquize:
+    enabled: true
+    crop_px:
+    - 2
+    - 5
+    noise_strength:
+    - 1
+    - 2
+    hue_shift:
+    - -0.8
+    - 0.8
+    gamma:
+    - 0.99
+    - 1.01
+    speed_range:
+    - 1.03
+    - 1.05
+    bitrate_jitter: 0.12
+    gop_range:
+    - 96
+    - 240
+    tail_trim_max: 0.08
+    audio_tone: true
+    tone_freq:
+    - 16000
+    - 19000
+    tone_amp:
+    - 0.002
+    - 0.005
+  hook_zoom:
+    enabled: true
+    scale: 1.12
+    duration: 1.5
+  beautify:
+    enabled: true
+    sharpen: 0.35
+    vignette: true
+    bg_resolution: 270
+    bg_blur: 10
+    bg_darken: 0.06
+    bg_saturation: 1.12
+  render_workers: 2
+audio:
+  enhance: true
+  highpass: 70
+  compressor: threshold=-20dB:ratio=2.5:attack=10:release=150:makeup=1.5
+clips:
+  sentence_based: true
+  min_duration: 20.0
+  max_duration: 35.0
+  hard_max_duration: 38.0
+  target_duration: 28.0
+  silence_trim: true
+  pad_start: -0.5
+  pad_end: 0.05
+  start_jitter: 0.0
+  sentence_snap: true
+  snap_max_extend: 8.0
+  sentence_soft_pause: 0.6
+  min_clip_duration: 18.0
+  max_internal_pause: 0.8
+  silence_split_threshold: 0.8
+whisper:
+  model_size: base
+  device: auto
+  compute_type: auto
+  language: null
+  batch_size: 8
+banner:
+  enabled: false
+promo_midroll:
+  enabled: true
+  video_path: assets/baner.mp4
+subtitles:
+  enabled: true
+  font_name: DejaVu Sans
+  font_size: 54
+  style: box
+  words_per_group: 2
+  bottom_margin: 680
+  active_word_highlight: true
+  active_word_color: '&H0000FFFF'
+  font_color: '&H00FFFFFF'
+  hook_overlay:
+    enabled: true
+    duration: 3.5
+    font_size: 66
+    font_color: '&H0000FFFF'
+    outline_color: '&H00000000'
+    outline_width: 8
+    top_margin: 360
+analysis:
+  enabled: true
+  use_llm: true
+  llm_url: http://localhost:11434
+  llm_model: qwen2.5:3b
+  llm_timeout: 180.0
+  language: ru
+  min_score: 4.0
+  max_clips: 0
+  drop_sponsor_segments: true
+ranking:
+  enabled: true
+  llm_model: qwen2.5:7b
+  auto_pull: true
+  top_n: 8
+  rerank_top: 20
+  min_total_score: 35.0
+  review_clips: true
+  weights:
+    hook_open: 1.0
+    payoff: 1.0
+    interest: 1.0
+    dynamics: 1.0
+    cleanliness: 1.0
+    cs2_terms: 1.0
+tiktok:
+  auto_upload: false
+  webhook_url: ''
+  delay_between_uploads: 900

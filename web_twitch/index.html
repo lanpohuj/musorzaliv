@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>MUSORZALIV Studio</title>
+  <link rel="stylesheet" href="/ui/studio.css">
+  <script src="/ui/studio.js" defer></script>
+</head>
+<body>
+  <header class="masthead">
+    <div class="brand"><span class="brand-icon" aria-hidden="true"><i></i><i></i><i></i></span><span>MUSORZALIV <span class="brand-studio">Studio</span></span></div>
+    <div class="service-status" id="services" aria-live="polite"></div>
+  </header>
+
+  <div class="shell">
+    <aside class="sidebar">
+      <button type="button" id="new" class="button primary full">+ Новая задача</button>
+      <h2>Задачи</h2>
+      <nav id="jobs" aria-label="Задачи"></nav>
+    </aside>
+
+    <main>
+      <div class="notice error" id="error" role="alert" hidden></div>
+      <section id="start">
+        <div class="intro">
+          <div class="eyebrow">Twitch Studio</div>
+          <h1>Нарезки со стрима</h1>
+          <p>Отбери игровые моменты, добавь русский дубляж и собери вертикальные клипы.</p>
+        </div>
+        <section class="panel source-panel">
+          <h2>Исходное видео</h2>
+          <form id="url-form">
+            <label for="url">Ссылка на запись или канал Twitch</label>
+            <div class="input-row">
+              <input id="url" type="url" placeholder="https://www.twitch.tv/videos/…" required>
+              <button class="button primary" type="submit">Начать</button>
+            </div>
+          </form>
+          <p class="muted">Ссылка на канал запускает запись и анализ текущего эфира до остановки.</p>
+          <div class="file-row">
+            <label class="button secondary file-button" for="local">Выбрать файл</label>
+            <input class="visually-hidden" id="local" type="file" accept=".mp4,.mov,.mkv,.webm,.m4v">
+            <span class="muted">MP4, MOV, MKV или WebM</span>
+          </div>
+        </section>
+      </section>
+
+      <section id="project" hidden>
+        <div class="project-head">
+          <div><div class="eyebrow" id="phase"></div><h1 id="title"></h1></div>
+          <div class="project-actions" id="actions"></div>
+        </div>
+        <div class="notice" id="state-note" aria-live="polite" hidden></div>
+        <div id="progress" class="panel progress" hidden>
+          <p id="progress-text" role="status"></p>
+          <progress max="1"></progress>
+        </div>
+        <section class="setup-grid" id="setup" hidden>
+          <div class="panel" id="source-card">
+            <h2>Запись</h2>
+            <img id="source-image" alt="Кадр исходной записи">
+            <p class="muted" id="source-details"></p>
+            <p id="estimate"></p>
+          </div>
+          <div class="panel settings">
+            <h2>Дубляж и реклама</h2>
+            <div class="voice-inputs">
+              <div><label for="streamer">Стример</label><div class="input-row"><input id="streamer" placeholder="ID голоса" maxlength="32" autocomplete="off"><button class="button secondary voice-test" data-role="streamer" aria-label="Прослушать голос стримера" type="button">▶</button></div><small id="streamer-name"></small></div>
+              <div><label for="guest">Собеседники</label><div class="input-row"><input id="guest" placeholder="ID голоса" maxlength="32" autocomplete="off"><button class="button secondary voice-test" data-role="guest" aria-label="Прослушать голос собеседников" type="button">▶</button></div><small id="guest-name"></small></div>
+            </div>
+            <button id="catalog-toggle" type="button" class="button secondary">Открыть каталог Fish Audio</button>
+            <div id="catalog" hidden>
+              <form id="voice-search" class="input-row">
+                <input id="voice-query" placeholder="Поиск по названию" aria-label="Поиск по названию голоса">
+                <button class="button secondary" type="submit">Найти</button>
+              </form>
+              <div id="catalog-list" aria-live="polite"></div>
+              <button id="catalog-more" type="button" class="button secondary" hidden>Ещё голоса</button>
+            </div>
+            <audio id="audio" controls hidden></audio>
+            <div class="ad-field">
+              <div><h3>Рекламный ролик</h3><span id="ad-name" class="muted">Без рекламы</span></div>
+              <label class="button secondary file-button" for="ad-file">Загрузить</label>
+              <input class="visually-hidden" id="ad-file" type="file" accept=".mp4,.mov,.mkv,.webm,.m4v">
+            </div>
+          </div>
+        </section>
+        <section id="clips" class="clip-list" aria-label="Подобранные фрагменты" hidden></section>
+        <section id="exports" class="panel" hidden><h2>Готовые файлы</h2><p id="folder" class="muted"></p><ul id="files"></ul></section>
+      </section>
+    </main>
+  </div>
+</body>
+</html>
