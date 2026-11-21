@@ -29,25 +29,90 @@ class ChatPulse:
     """Record only burst timestamps so analysis can catch up with the capture."""
     def __init__(self):
         self.started = time.monotonic()
-        self.recent = deque(maxlen=20000)
+        self.synced = False
+        self.buckets = deque(maxlen=180)
         self.bursts = []
         self.lock = Lock()
 
+    def sync_origin(self, stream_end, buffer_delay=2.5):
+        with self.lock:
+            if self.synced:
+                return
+            now = time.monotonic()
+            stream_time_now = max(0.0, float(stream_end) - float(buffer_delay))
+            new_started = now - stream_time_now
+            delta = int(self.started - new_started)
+            if delta != 0:
+                for b in self.buckets:
+                    b["sec"] += delta
+                self.bursts = [t + delta for t in self.bursts]
+            self.started = new_started
+            self.synced = True
+
     def message(self, second, nick, line):
-        while self.recent and self.recent[0][0] < second - 180:
-            self.recent.popleft()
-        self.recent.append((second, nick))
-        if self.bursts and second - self.bursts[-1] < 8:
-            return
-        recent = set()
-        for stamp, author in reversed(self.recent):
-            if stamp < second - 8:
-                break
-            recent.add(author)
-        span = min(172, max(1, second - 8))
-        threshold = max(5, 2.5 * len(self.recent) * 8 / span)
-        if len(recent) >= threshold or (len(recent) >= 2 and "clip that" in line.lower()):
-            with self.lock:
+        with self.lock:
+            while self.buckets and self.buckets[0]["sec"] < second - 180:
+                self.buckets.popleft()
+
+            if self.buckets and self.buckets[-1]["sec"] == second:
+                self.buckets[-1]["count"] += 1
+                self.buckets[-1]["nicks"].add(nick)
+            elif not self.buckets or second > self.buckets[-1]["sec"]:
+                self.buckets.append({"sec": second, "count": 1, "nicks": {nick}})
+            else:
+                for b in self.buckets:
+                    if b["sec"] == second:
+                        b["count"] += 1
+                        b["nicks"].add(nick)
+                        break
+                else:
+                    for i, b in enumerate(self.buckets):
+                        if b["sec"] > second:
+                            self.buckets.insert(i, {"sec": second, "count": 1, "nicks": {nick}})
+                            break
+
+            if self.bursts and second - self.bursts[-1] < 8:
+                return
+
+            recent_buckets = [b for b in self.buckets if b["sec"] >= second - 7]
+            recent_count = sum(b["count"] for b in recent_buckets)
+            recent_nicks = set.union(*(b["nicks"] for b in recent_buckets)) if recent_buckets else set()
+            recent_users = len(recent_nicks)
+
+            if recent_users < 2:
+                return
+            if recent_users < 3 and "clip that" not in line.lower():
+                return
+
+            cur_bucket = [b for b in recent_buckets if b["sec"] == second]
+            cur_count = cur_bucket[0]["count"] if cur_bucket else 0
+            cur_users = len(cur_bucket[0]["nicks"]) if cur_bucket else 0
+
+            baseline_buckets = [b for b in self.buckets if b["sec"] < second - 7]
+            recent_rate = recent_count / 8.0
+
+            is_spike = False
+            if len(baseline_buckets) < 8:
+                if recent_users >= 8 or (recent_users >= 2 and "clip that" in line.lower()):
+                    is_spike = True
+            else:
+                counts = [b["count"] for b in baseline_buckets]
+                sorted_counts = sorted(counts)
+                median_count = sorted_counts[len(sorted_counts) // 2]
+                mean_count = sum(counts) / len(counts)
+                variance = sum((c - mean_count) ** 2 for c in counts) / len(counts)
+                std_count = variance ** 0.5
+                z_score = (recent_rate - mean_count) / (std_count + 1e-5)
+                z_cur = (cur_count - mean_count) / (std_count + 1e-5)
+
+                if (z_score >= 2.0 or recent_rate >= 1.5 * median_count) and recent_users >= 6:
+                    is_spike = True
+                elif (z_cur >= 2.2 or cur_count >= 1.75 * median_count) and cur_users >= 8 and cur_count >= mean_count + 1.2 * std_count:
+                    is_spike = True
+                elif "clip that" in line.lower() and (cur_count >= 1.2 * median_count or recent_rate >= 1.2 * median_count) and recent_users >= 2:
+                    is_spike = True
+
+            if is_spike:
                 self.bursts.append(second)
 
     def times(self, start, end):
@@ -73,14 +138,22 @@ class ChatPulse:
                                 continue
                             if not packet:
                                 break
-                            *lines, pending = (pending + packet).split(b"\r\n")
-                            for line in lines:
+                            pending += packet
+                            parts = pending.split(b"\r\n")
+                            pending = parts.pop()
+                            for line in parts:
+                                if not line:
+                                    continue
                                 if line.startswith(b"PING "):
                                     conn.sendall(b"PONG " + line[5:] + b"\r\n")
                                 elif b" PRIVMSG #" in line:
-                                    author, _, message = line.decode(errors="replace").partition(" PRIVMSG #")
-                                    self.message(int(time.monotonic()-self.started),
-                                                 author.split("!")[0], message)
+                                    raw_line = line.decode(errors="replace")
+                                    prefix, _, trail = raw_line.partition(" PRIVMSG #")
+                                    channel_and_msg = trail.partition(" :")
+                                    message = channel_and_msg[2] if channel_and_msg[1] else channel_and_msg[0]
+                                    user_part = prefix.split(" :", 1)[-1] if " :" in prefix else prefix.lstrip(":")
+                                    author = user_part.split("!")[0]
+                                    self.message(int(time.monotonic() - self.started), author, message)
             except OSError:
                 pass
             done.wait(5)
@@ -179,6 +252,11 @@ class LiveSessions:
             if manifest.exists():
                 lines = manifest.read_text().splitlines(keepends=True)
                 rows = [r for r in csv.reader(line for line in lines if line.endswith("\n")) if len(r) == 3]
+            if rows and hasattr(chat, "sync_origin") and not getattr(chat, "synced", False):
+                try:
+                    chat.sync_origin(float(rows[0][2]), buffer_delay=2.5)
+                except Exception as exc:
+                    print(f"[*] Не удалось синхронизировать ChatPulse: {exc}")
             while index < len(rows):
                 duration = float(rows[index][2]) - float(rows[index][1])
                 if duration < 1:
