@@ -389,6 +389,7 @@ class Job:
             result, usage = model.adapt(proxy, hints, end - start)
             if hints and not result.turns and sum(row["end"] - row["start"] for row in hints) > 1.2:
                 raise media.EditError(f"{editor.analysis_config()[0]} пропустил речь в выбранном отрывке. Повторите перевод или измените границы.")
+            result = editor.align_turns_to_speech(result, transcript, end - start)
             return result, usage
 
         try:

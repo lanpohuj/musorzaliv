@@ -282,13 +282,48 @@ def voice_track(parts: list[dict], total: float, target: Path) -> None:
             if (track.getframerate(), track.getnchannels(), track.getsampwidth()) != (RATE, 1, 2):
                 raise EditError("Озвучка имеет неожиданный аудиоформат.")
             audio = track.readframes(track.getnframes())
-        if len(audio) // 2 > stop - start:
-            raise EditError("Русская реплика не помещается. Сократите текст и повторите предпросмотр.")
+        audio_samples = len(audio) // 2
+        slot_samples = stop - start
+        if audio_samples > slot_samples:
+            if audio_samples - slot_samples <= 96:
+                audio = audio[:slot_samples * 2]
+            else:
+                raise EditError("Русская реплика не помещается. Сократите текст и повторите предпросмотр.")
         timeline[start * 2:start * 2 + len(audio)] = audio
         previous_end = stop
     with wave.open(str(target), "wb") as output:
         output.setparams((1, 2, RATE, count, "NONE", "not compressed"))
         output.writeframes(timeline)
+
+
+def build_ducking_volume_expr(intervals: list[tuple[float, float]], base_vol: float = 0.78,
+                              duck_vol: float = 0.16, fade: float = 0.10) -> str:
+    """Build an FFmpeg volume expression that smoothly ducks audio during active intervals."""
+    if not intervals:
+        return f"{base_vol:.2f}"
+
+    merged: list[list[float]] = []
+    for s, e in sorted(intervals):
+        if not merged:
+            merged.append([float(s), float(e)])
+        elif s <= merged[-1][1] + (fade * 2.0):
+            merged[-1][1] = max(merged[-1][1], float(e))
+        else:
+            merged.append([float(s), float(e)])
+
+    diff = base_vol - duck_vol
+    expr = f"{base_vol:.2f}"
+    for s, e in reversed(merged):
+        s_fade = max(0.0, s - fade)
+        e_fade = e + fade
+        ramp_down = f"({base_vol:.2f}-{diff:.2f}*(t-{s_fade:.3f})/{fade:.3f})"
+        ramp_up = f"({duck_vol:.2f}+{diff:.2f}*(t-{e:.3f})/{fade:.3f})"
+        expr = (
+            f"if(between(t,{s_fade:.3f},{s:.3f}),{ramp_down},"
+            f"if(between(t,{s:.3f},{e:.3f}),{duck_vol:.2f},"
+            f"if(between(t,{e:.3f},{e_fade:.3f}),{ramp_up},{expr})))"
+        )
+    return expr
 
 
 def _fit_stream(graph: list[str], source: str, output: str, width: int, height: int) -> None:
@@ -398,10 +433,13 @@ def render(source: Path, clip: dict, source_has_audio: bool, work: Path, target:
     source_audio = "[0:a]asetpts=PTS-STARTPTS," if source_has_audio else "anullsrc=r=48000:cl=stereo,"
     graph.append(f"{source_audio}{sound},apad,atrim=end_sample={span}[original]")
     if voice:
+        turns = clip.get("turns") or []
+        turn_intervals = [(t["start"], t["end"]) for t in turns if t.get("russian")]
+        duck_expr = build_ducking_volume_expr(turn_intervals, base_vol=0.78, duck_vol=0.16, fade=0.10)
         graph.extend([
             f"[1:a]{sound},asplit=2[key][dub]",
-            "[original]volume=0.78[quiet]",
-            "[quiet][key]sidechaincompress=threshold=0.025:ratio=10:attack=15:release=260[duck]",
+            f"[original]volume=eval=frame:volume='{duck_expr}'[quiet]",
+            "[quiet][key]sidechaincompress=threshold=0.015:ratio=16:attack=15:release=320[duck]",
             "[duck][dub]amix=inputs=2:duration=first:normalize=0,alimiter=limit=0.93:level=0:latency=1[mix]",
         ])
     else:
